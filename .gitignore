@@ -1,0 +1,13 @@
+.env
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.insightface/
+data/
+calibration/
+reports/
+benchmark/

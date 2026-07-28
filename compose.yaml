@@ -1,0 +1,26 @@
+services:
+  ai-face-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-face-service:local
+    env_file:
+      - .env
+    environment:
+      FACE_DATABASE_PATH: /service/data/faces.db
+      INSIGHTFACE_MODEL_ROOT: /home/service/.insightface
+    ports:
+      - "${AI_FACE_PORT:-8000}:8000"
+    volumes:
+      - insightface-models:/home/service/.insightface
+      - face-data:/service/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  insightface-models:
+  face-data:
