@@ -1,8 +1,18 @@
 """Public HTTP endpoint definitions."""
 
+import json
 from typing import Annotated, cast
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from starlette.concurrency import run_in_threadpool
 
 from app.config import Settings
@@ -12,11 +22,17 @@ from app.models.schemas import (
     EmbeddingResponse,
     ErrorResponse,
     HealthResponse,
+    IdentifyFaceResponse,
     PerformanceResponse,
     RegisterFaceResponse,
     VerifyFaceResponse,
 )
-from app.services.face_service import FaceService
+from app.services.face_service import (
+    FaceService,
+    IdentifyReason,
+    MultipleFacesDetectedError,
+    NoFaceDetectedError,
+)
 from app.services.performance import PerformanceTracker
 from app.utils.uploads import read_image_upload
 
@@ -117,6 +133,105 @@ async def verify_face(
     return VerifyFaceResponse(
         matched=result.matched,
         similarity=result.similarity,
+    )
+
+
+@router.post(
+    "/faces/identify",
+    response_model=IdentifyFaceResponse,
+    responses=ERROR_RESPONSES,
+    tags=["faces"],
+    summary="Identify a face among supplied candidate students",
+)
+async def identify_face(
+    candidate_student_ids_json: Annotated[
+        str,
+        Form(alias="candidateStudentIds"),
+    ],
+    image: Annotated[UploadFile, File()],
+    service: Annotated[FaceService, Depends(get_face_service)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> IdentifyFaceResponse:
+    candidate_ids = _parse_candidate_student_ids(
+        candidate_student_ids_json,
+        settings.max_identify_candidates,
+    )
+    image_bytes = await read_image_upload(image, settings.max_upload_size_bytes)
+    try:
+        result = await run_in_threadpool(
+            service.identify_face,
+            candidate_ids,
+            image_bytes,
+        )
+    except NoFaceDetectedError:
+        return _unmatched_identification("NO_FACE_DETECTED")
+    except MultipleFacesDetectedError:
+        return _unmatched_identification("MULTIPLE_FACES")
+
+    return IdentifyFaceResponse(
+        matched=result.matched,
+        student_id=result.student_id,
+        similarity=result.similarity,
+        liveness_passed=result.liveness_passed,
+        reason=result.reason,
+    )
+
+
+def _parse_candidate_student_ids(
+    raw_value: str,
+    maximum_candidates: int,
+) -> tuple[str, ...]:
+    try:
+        decoded = json.loads(raw_value)
+        if not isinstance(decoded, list):
+            raise TypeError
+        if not decoded:
+            raise ValueError("At least one candidate is required.")
+        if len(decoded) > maximum_candidates:
+            raise ValueError(
+                f"At most {maximum_candidates} candidates are allowed."
+            )
+        if any(not isinstance(value, str) for value in decoded):
+            raise TypeError
+        return tuple(
+            dict.fromkeys(str(UUID(value)) for value in decoded)
+        )
+    except json.JSONDecodeError as exc:
+        raise _candidate_ids_error(
+            "candidateStudentIds must be a JSON UUID array."
+        ) from exc
+    except TypeError as exc:
+        raise _candidate_ids_error(
+            "candidateStudentIds must be a JSON UUID array."
+        ) from exc
+    except ValueError as exc:
+        message = str(exc)
+        if message.startswith("At least") or message.startswith("At most"):
+            raise _candidate_ids_error(message) from exc
+        raise _candidate_ids_error(
+            "candidateStudentIds must be a JSON UUID array."
+        ) from exc
+
+
+def _candidate_ids_error(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "code": "invalid_candidate_student_ids",
+            "message": message,
+        },
+    )
+
+
+def _unmatched_identification(
+    reason: IdentifyReason,
+) -> IdentifyFaceResponse:
+    return IdentifyFaceResponse(
+        matched=False,
+        student_id=None,
+        similarity=0.0,
+        liveness_passed=True,
+        reason=reason,
     )
 
 

@@ -1,5 +1,8 @@
-"""Contract tests for the Phase 2 API."""
+"""Contract tests for the public API."""
 
+import json
+
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -7,8 +10,15 @@ from app.main import create_app
 from app.services.face_service import (
     DetectedFace,
     FaceEmbedding,
+    FaceIdentification,
     FaceVerification,
+    MultipleFacesDetectedError,
+    NoFaceDetectedError,
 )
+
+
+CANDIDATE_1 = "2f52f06f-59ed-4519-bb86-69cb59fb3197"
+CANDIDATE_2 = "12807f44-e4e2-464a-b525-9812b3dc0f3c"
 
 
 class FakeFaceService:
@@ -24,6 +34,21 @@ class FakeFaceService:
         assert image_bytes == b"test-image"
         return FaceVerification(matched=True, similarity=0.84)
 
+    def identify_face(
+        self,
+        candidate_student_ids: tuple[str, ...],
+        image_bytes: bytes,
+    ) -> FaceIdentification:
+        assert candidate_student_ids == (CANDIDATE_1, CANDIDATE_2)
+        assert image_bytes == b"test-image"
+        return FaceIdentification(
+            matched=True,
+            student_id=CANDIDATE_2,
+            similarity=0.93,
+            liveness_passed=True,
+            reason="MATCHED",
+        )
+
     def detect_face(self, image_bytes: bytes) -> DetectedFace:
         assert image_bytes == b"test-image"
         return DetectedFace(
@@ -36,10 +61,13 @@ class FakeFaceService:
         return FaceEmbedding(values=tuple(0.0 for _ in range(512)))
 
 
-def make_client() -> TestClient:
+def make_client(
+    face_service: FakeFaceService | None = None,
+    settings: Settings | None = None,
+) -> TestClient:
     app = create_app(
-        face_service=FakeFaceService(),
-        settings=Settings(max_upload_size_mb=1),
+        face_service=face_service or FakeFaceService(),
+        settings=settings or Settings(max_upload_size_mb=1),
     )
     return TestClient(app)
 
@@ -97,6 +125,135 @@ def test_verify_face_contract() -> None:
     assert response.json() == {
         "matched": True,
         "similarity": 0.84,
+    }
+
+
+def test_identify_face_contract() -> None:
+    response = make_client().post(
+        "/faces/identify",
+        data={
+            "candidateStudentIds": json.dumps(
+                [CANDIDATE_1, CANDIDATE_2]
+            )
+        },
+        files=image_file(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "matched": True,
+        "studentId": CANDIDATE_2,
+        "similarity": 0.93,
+        "livenessPassed": True,
+        "reason": "MATCHED",
+    }
+
+
+def test_identify_face_no_match_contract() -> None:
+    class NoMatchFaceService(FakeFaceService):
+        def identify_face(
+            self,
+            candidate_student_ids: tuple[str, ...],
+            image_bytes: bytes,
+        ) -> FaceIdentification:
+            return FaceIdentification(
+                matched=False,
+                student_id=None,
+                similarity=0.41,
+                liveness_passed=True,
+                reason="NOT_MATCHED",
+            )
+
+    response = make_client(NoMatchFaceService()).post(
+        "/faces/identify",
+        data={"candidateStudentIds": json.dumps([CANDIDATE_1])},
+        files=image_file(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "matched": False,
+        "studentId": None,
+        "similarity": 0.41,
+        "livenessPassed": True,
+        "reason": "NOT_MATCHED",
+    }
+
+
+@pytest.mark.parametrize(
+    "candidate_value",
+    [
+        "not-json",
+        "{}",
+        "[]",
+        '["not-a-uuid"]',
+        "[123]",
+    ],
+)
+def test_identify_rejects_invalid_candidate_json(
+    candidate_value: str,
+) -> None:
+    response = make_client().post(
+        "/faces/identify",
+        data={"candidateStudentIds": candidate_value},
+        files=image_file(),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == (
+        "invalid_candidate_student_ids"
+    )
+
+
+def test_identify_rejects_too_many_candidates() -> None:
+    response = make_client(
+        settings=Settings(max_upload_size_mb=1, max_identify_candidates=1)
+    ).post(
+        "/faces/identify",
+        data={
+            "candidateStudentIds": json.dumps(
+                [CANDIDATE_1, CANDIDATE_2]
+            )
+        },
+        files=image_file(),
+    )
+
+    assert response.status_code == 400
+    assert "At most 1" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("service_error", "reason"),
+    [
+        (NoFaceDetectedError("No face."), "NO_FACE_DETECTED"),
+        (MultipleFacesDetectedError("Multiple faces."), "MULTIPLE_FACES"),
+    ],
+)
+def test_identify_returns_a_reason_for_face_count_failures(
+    service_error: Exception,
+    reason: str,
+) -> None:
+    class FaceCountFailureService(FakeFaceService):
+        def identify_face(
+            self,
+            candidate_student_ids: tuple[str, ...],
+            image_bytes: bytes,
+        ) -> FaceIdentification:
+            raise service_error
+
+    response = make_client(FaceCountFailureService()).post(
+        "/faces/identify",
+        data={"candidateStudentIds": json.dumps([CANDIDATE_1])},
+        files=image_file(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "matched": False,
+        "studentId": None,
+        "similarity": 0.0,
+        "livenessPassed": True,
+        "reason": reason,
     }
 
 

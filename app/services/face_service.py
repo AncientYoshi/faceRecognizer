@@ -1,7 +1,7 @@
 """Face-service contracts, results, and domain errors."""
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 
 EMBEDDING_DIMENSION = 512
@@ -17,6 +17,24 @@ class DetectedFace:
 class FaceVerification:
     matched: bool
     similarity: float
+
+
+IdentifyReason = Literal[
+    "MATCHED",
+    "NOT_MATCHED",
+    "NO_FACE_DETECTED",
+    "MULTIPLE_FACES",
+    "LIVENESS_FAILED",
+]
+
+
+@dataclass(frozen=True)
+class FaceIdentification:
+    matched: bool
+    student_id: str | None
+    similarity: float
+    liveness_passed: bool
+    reason: IdentifyReason
 
 
 @dataclass(frozen=True)
@@ -38,6 +56,13 @@ class FaceService(Protocol):
         self, student_id: str, image_bytes: bytes
     ) -> FaceVerification:
         """Compare an uploaded face with a registered face."""
+
+    def identify_face(
+        self,
+        candidate_student_ids: tuple[str, ...],
+        image_bytes: bytes,
+    ) -> FaceIdentification:
+        """Find the best match only among the supplied student IDs."""
 
     def detect_face(self, image_bytes: bytes) -> DetectedFace:
         """Return the single detected face."""
@@ -123,6 +148,13 @@ class UnavailableFaceService:
     def verify_face(
         self, student_id: str, image_bytes: bytes
     ) -> FaceVerification:
+        raise PipelineNotReadyError(self._message)
+
+    def identify_face(
+        self,
+        candidate_student_ids: tuple[str, ...],
+        image_bytes: bytes,
+    ) -> FaceIdentification:
         raise PipelineNotReadyError(self._message)
 
     def detect_face(self, image_bytes: bytes) -> DetectedFace:

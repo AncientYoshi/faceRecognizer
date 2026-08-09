@@ -15,7 +15,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     max_upload_size_mb: int = Field(default=10, ge=1, le=50)
-    similarity_threshold: float = Field(default=0.50, ge=-1.0, le=1.0)
+    similarity_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+    max_identify_candidates: int = Field(default=500, ge=1, le=10_000)
+    face_database_url: str | None = None
     face_database_path: str = "data/faces.db"
     face_database_timeout_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
 

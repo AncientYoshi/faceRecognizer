@@ -70,6 +70,7 @@ class FakeEmbeddingRepository:
         self.initialized = False
         self.records: dict[str, StoredEmbedding] = {}
         self._next_id = 1
+        self.last_candidate_ids: tuple[str, ...] | None = None
 
     def initialize(self) -> None:
         self.initialized = True
@@ -92,6 +93,17 @@ class FakeEmbeddingRepository:
 
     def find_by_student_id(self, student_id: str) -> StoredEmbedding | None:
         return self.records.get(student_id)
+
+    def find_by_student_ids(
+        self,
+        student_ids: tuple[str, ...],
+    ) -> list[StoredEmbedding]:
+        self.last_candidate_ids = student_ids
+        return [
+            self.records[student_id]
+            for student_id in student_ids
+            if student_id in self.records
+        ]
 
 
 def settings(**overrides: object) -> Settings:
@@ -323,3 +335,70 @@ def test_verification_rejects_an_unregistered_student_before_inference() -> None
         service.verify_face("UNKNOWN", b"image")
 
     assert analyzer.received_max_num is None
+
+
+def test_identifies_the_best_registered_candidate() -> None:
+    candidate_1 = "2f52f06f-59ed-4519-bb86-69cb59fb3197"
+    candidate_2 = "12807f44-e4e2-464a-b525-9812b3dc0f3c"
+    first = np.zeros(512, dtype=np.float32)
+    first[0] = 1.0
+    second = np.zeros(512, dtype=np.float32)
+    second[1] = 1.0
+    repository = FakeEmbeddingRepository()
+    repository.upsert(candidate_1, tuple(float(value) for value in first))
+    repository.upsert(candidate_2, tuple(float(value) for value in second))
+    service, _, _ = service_with(
+        [FakeFace(embedding=second)],
+        repository=repository,
+        app_settings=settings(similarity_threshold=0.5),
+    )
+
+    result = service.identify_face(
+        (candidate_1, candidate_2),
+        b"image",
+    )
+
+    assert result.matched is True
+    assert result.student_id == candidate_2
+    assert result.similarity == pytest.approx(1.0)
+    assert result.liveness_passed is True
+    assert result.reason == "MATCHED"
+    assert repository.last_candidate_ids == (candidate_1, candidate_2)
+
+
+def test_identification_returns_no_match_for_unregistered_candidates() -> None:
+    candidate_id = "2f52f06f-59ed-4519-bb86-69cb59fb3197"
+    service, analyzer, repository = service_with([FakeFace()])
+
+    result = service.identify_face((candidate_id,), b"image")
+
+    assert result.matched is False
+    assert result.student_id is None
+    assert result.similarity == 0.0
+    assert result.reason == "NOT_MATCHED"
+    assert repository.last_candidate_ids == (candidate_id,)
+    assert analyzer.received_max_num == 0
+
+
+def test_identification_clamps_a_negative_similarity_to_zero() -> None:
+    candidate_id = "2f52f06f-59ed-4519-bb86-69cb59fb3197"
+    registered = np.zeros(512, dtype=np.float32)
+    registered[0] = 1.0
+    presented = np.zeros(512, dtype=np.float32)
+    presented[0] = -1.0
+    repository = FakeEmbeddingRepository()
+    repository.upsert(
+        candidate_id,
+        tuple(float(value) for value in registered),
+    )
+    service, _, _ = service_with(
+        [FakeFace(embedding=presented)],
+        repository=repository,
+    )
+
+    result = service.identify_face((candidate_id,), b"image")
+
+    assert result.matched is False
+    assert result.student_id is None
+    assert result.similarity == 0.0
+    assert result.reason == "NOT_MATCHED"

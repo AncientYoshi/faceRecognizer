@@ -9,10 +9,14 @@ services:
     environment:
       FACE_DATABASE_PATH: /service/data/faces.db
       INSIGHTFACE_MODEL_ROOT: /home/service/.insightface
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${AI_FACE_PORT:-8000}:8000"
     volumes:
       - insightface-models:/home/service/.insightface
+      # Retained as a SQLite fallback and for one-time migration of existing
+      # embeddings after switching FACE_DATABASE_URL to PostgreSQL.
       - face-data:/service/data
     read_only: true
     tmpfs:

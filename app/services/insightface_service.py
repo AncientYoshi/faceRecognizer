@@ -14,6 +14,7 @@ from app.config import Settings
 from app.repositories.embedding_repository import (
     EmbeddingRepository,
     EmbeddingRepositoryError,
+    PostgreSQLEmbeddingRepository,
     SQLiteEmbeddingRepository,
 )
 from app.services.face_service import (
@@ -22,6 +23,7 @@ from app.services.face_service import (
     EmbeddingError,
     EmbeddingStorageError,
     FaceEmbedding,
+    FaceIdentification,
     FaceVerification,
     InferenceError,
     InvalidImageError,
@@ -84,9 +86,13 @@ class InsightFaceService:
                 max_pixels=settings.max_image_pixels,
             )
         )
-        self._embedding_repository = (
-            embedding_repository
-            or SQLiteEmbeddingRepository(
+        self._embedding_repository = embedding_repository or (
+            PostgreSQLEmbeddingRepository(
+                settings.face_database_url,
+                settings.face_database_timeout_seconds,
+            )
+            if settings.face_database_url
+            else SQLiteEmbeddingRepository(
                 settings.face_database_path,
                 settings.face_database_timeout_seconds,
             )
@@ -193,32 +199,83 @@ class InsightFaceService:
                 )
 
             candidate = self.generate_embedding(image_bytes)
-            stored_values = np.asarray(stored.values, dtype=np.float32)
+            stored_values = self._normalized_stored_values(stored.values)
             candidate_values = np.asarray(
                 candidate.values,
                 dtype=np.float32,
             )
-
-            if (
-                stored_values.size != EMBEDDING_DIMENSION
-                or not np.all(np.isfinite(stored_values))
-            ):
-                raise EmbeddingStorageError(
-                    "The registered face embedding is invalid."
-                )
-
-            stored_norm = float(np.linalg.norm(stored_values))
-            if stored_norm <= 0.0:
-                raise EmbeddingStorageError(
-                    "The registered face embedding has zero magnitude."
-                )
-
-            stored_values /= stored_norm
             similarity = float(np.dot(stored_values, candidate_values))
             similarity = float(np.clip(similarity, -1.0, 1.0))
             return FaceVerification(
                 matched=similarity >= self._settings.similarity_threshold,
                 similarity=similarity,
+            )
+
+    def identify_face(
+        self,
+        candidate_student_ids: tuple[str, ...],
+        image_bytes: bytes,
+    ) -> FaceIdentification:
+        with self._performance.track("identification_total_ms"):
+            self._ensure_ready()
+            normalized_ids = tuple(
+                dict.fromkeys(
+                    self._normalize_student_id(student_id)
+                    for student_id in candidate_student_ids
+                )
+            )
+            if not normalized_ids:
+                raise InvalidStudentIdError(
+                    "At least one candidate student ID is required."
+                )
+
+            candidate = self.generate_embedding(image_bytes)
+            candidate_values = np.asarray(candidate.values, dtype=np.float32)
+            try:
+                with self._performance.track("candidate_embeddings_load_ms"):
+                    stored_candidates = (
+                        self._embedding_repository.find_by_student_ids(
+                            normalized_ids
+                        )
+                    )
+            except EmbeddingRepositoryError as exc:
+                raise EmbeddingStorageError(
+                    "Candidate face embeddings could not be loaded."
+                ) from exc
+
+            if not stored_candidates:
+                return FaceIdentification(
+                    matched=False,
+                    student_id=None,
+                    similarity=0.0,
+                    liveness_passed=True,
+                    reason="NOT_MATCHED",
+                )
+
+            similarities: list[float] = []
+            for stored in stored_candidates:
+                stored_values = self._normalized_stored_values(stored.values)
+                similarities.append(
+                    float(np.dot(stored_values, candidate_values))
+                )
+
+            best_index = int(np.argmax(similarities))
+            best_similarity = float(
+                np.clip(similarities[best_index], 0.0, 1.0)
+            )
+            matched = (
+                best_similarity >= self._settings.similarity_threshold
+            )
+            return FaceIdentification(
+                matched=matched,
+                student_id=(
+                    stored_candidates[best_index].student_id
+                    if matched
+                    else None
+                ),
+                similarity=best_similarity,
+                liveness_passed=True,
+                reason="MATCHED" if matched else "NOT_MATCHED",
             )
 
     def detect_face(self, image_bytes: bytes) -> DetectedFace:
@@ -280,6 +337,25 @@ class InsightFaceService:
                 "studentId must contain at most 128 characters."
             )
         return normalized
+
+    @staticmethod
+    def _normalized_stored_values(
+        values: tuple[float, ...],
+    ) -> NDArray[np.float32]:
+        stored_values = np.asarray(values, dtype=np.float32)
+        if (
+            stored_values.size != EMBEDDING_DIMENSION
+            or not np.all(np.isfinite(stored_values))
+        ):
+            raise EmbeddingStorageError(
+                "The registered face embedding is invalid."
+            )
+        stored_norm = float(np.linalg.norm(stored_values))
+        if stored_norm <= 0.0:
+            raise EmbeddingStorageError(
+                "The registered face embedding has zero magnitude."
+            )
+        return stored_values / stored_norm
 
     def _ensure_ready(self) -> None:
         if not self.is_ready:

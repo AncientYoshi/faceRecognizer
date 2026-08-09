@@ -1,14 +1,15 @@
 # AI Face Service
 
-Independent FastAPI service for face detection, registration, and
-verification. The service is being built and tested independently before it
-is integrated with the Spring Boot attendance backend.
+Independent FastAPI service for face detection, registration, verification,
+and closed-set identification. The service is built and tested independently
+before integration with the Spring Boot attendance backend.
 
 This service covers Phase 1 through Phase 10: setup, API design, detection,
-aligned embeddings, local registration, verification, threshold calibration,
-error handling, performance measurement, and container deployment. It uses one
+aligned embeddings, registration, verification, threshold calibration, error
+handling, performance measurement, and container deployment. It uses one
 InsightFace pipeline for detection, alignment, and 512-dimensional embeddings,
-with SQLite persistence for independent development and testing.
+with shared PostgreSQL persistence for Spring Boot integration and a SQLite
+fallback for isolated development.
 
 ## Current scope
 
@@ -16,15 +17,16 @@ with SQLite persistence for independent development and testing.
 | --- | --- |
 | FastAPI application and environment configuration | Implemented |
 | `GET /health` | Implemented |
-| Register, verify, and detect API contracts | Implemented and contract-tested |
+| Register, verify, identify, and detect API contracts | Implemented and contract-tested |
 | Upload type, empty-file, and size validation | Implemented |
 | Consistent JSON error envelope | Implemented |
 | InsightFace startup model loading | Implemented |
 | Single-face detection and bounding box | Implemented |
 | Aligned, normalized 512-D embedding | Implemented |
 | Atomic registration/re-registration | Implemented |
-| Local SQLite embedding persistence | Implemented |
+| Shared PostgreSQL and local SQLite embedding persistence | Implemented |
 | Cosine-similarity verification | Implemented |
+| Candidate-restricted closed-set identification | Implemented |
 | Labeled-pair threshold calibration | Implemented |
 | Image and face quality checks | Implemented |
 | Consistent errors including unexpected failures | Implemented |
@@ -116,8 +118,8 @@ pytest
 
 The tests inject a fake analyzer while exercising image decoding, model
 preparation, exactly-one-face enforcement, bounding-box handling, embedding
-dimension validation, L2 normalization, SQLite persistence, replacement
-semantics, threshold metrics, quality rejection, error envelopes, threshold
+dimension validation, L2 normalization, PostgreSQL/SQLite persistence,
+replacement semantics, threshold metrics, quality rejection, error envelopes, threshold
 matching, bounded performance tracking, benchmark summaries, and
 unregistered-student errors. This keeps automated tests independent of a
 large model download.
@@ -197,9 +199,9 @@ curl -X POST http://localhost:8000/faces/register \
   -F 'image=@face.jpg'
 ```
 
-Registration generates a normalized embedding and stores it in SQLite. It does
-not store the uploaded image. Re-registering `STU-001` replaces that student's
-previous embedding.
+Registration generates a normalized embedding and stores it in the configured
+database. It does not store the uploaded image. Re-registering `STU-001`
+replaces that student's previous embedding.
 
 ### Verify face
 
@@ -232,6 +234,54 @@ curl -X POST http://localhost:8000/faces/verify \
 `studentId` returns HTTP `404` with `student_not_registered`.
 Similarity below the threshold is a successful HTTP `200` response with
 `"matched": false`; it is not an API error.
+
+### Identify face among candidates
+
+```http
+POST /faces/identify
+Content-Type: multipart/form-data
+```
+
+Fields:
+
+- `image`: JPEG, PNG, or WebP image containing exactly one face
+- `candidateStudentIds`: JSON-array string containing Spring student UUIDs
+
+Example:
+
+```bash
+curl -X POST http://localhost:8000/faces/identify \
+  -F 'candidateStudentIds=["2f52f06f-59ed-4519-bb86-69cb59fb3197","12807f44-e4e2-464a-b525-9812b3dc0f3c"]' \
+  -F 'image=@attendance-face.jpg'
+```
+
+Matched response:
+
+```json
+{
+  "matched": true,
+  "studentId": "2f52f06f-59ed-4519-bb86-69cb59fb3197",
+  "similarity": 0.93,
+  "livenessPassed": true,
+  "reason": "MATCHED"
+}
+```
+
+The service generates one query embedding, loads registered embeddings only
+for the supplied candidates, and returns the highest score. It never searches
+students outside the supplied set. Unknown or unregistered candidate UUIDs are
+ignored. When none of the registered candidates reaches
+`SIMILARITY_THRESHOLD`, the response has `matched: false`, a null `studentId`,
+and reason `NOT_MATCHED`.
+
+No face and multiple-face inputs return HTTP `200` identification responses
+with reasons `NO_FACE_DETECTED` and `MULTIPLE_FACES`, respectively. Invalid
+candidate JSON, an empty candidate array, or more than
+`MAX_IDENTIFY_CANDIDATES` entries returns HTTP `400`.
+
+`livenessPassed` is currently always `true` as a bench-prototype compatibility
+value. No liveness or anti-spoofing model is implemented, so this field must not
+be treated as proof of a live person in production.
 
 ### Detect face
 
@@ -326,8 +376,10 @@ from `.env`.
 | --- | --- | --- |
 | `MAX_UPLOAD_SIZE_MB` | `10` | Maximum accepted image size |
 | `SIMILARITY_THRESHOLD` | `0.50` | Minimum cosine similarity for a match |
+| `MAX_IDENTIFY_CANDIDATES` | `500` | Maximum candidate UUIDs accepted by one identification request |
+| `FACE_DATABASE_URL` | empty | PostgreSQL URL; when set, PostgreSQL replaces the SQLite fallback |
 | `FACE_DATABASE_PATH` | `data/faces.db` | Local SQLite embedding database |
-| `FACE_DATABASE_TIMEOUT_SECONDS` | `5.0` | SQLite lock wait timeout |
+| `FACE_DATABASE_TIMEOUT_SECONDS` | `5.0` | Database connection/lock timeout |
 | `INSIGHTFACE_MODEL_NAME` | `buffalo_l` | InsightFace model pack |
 | `INSIGHTFACE_MODEL_ROOT` | `~/.insightface` | Parent directory for model files |
 | `INSIGHTFACE_PROVIDERS` | `CPUExecutionProvider` | Comma-separated ONNX Runtime providers |
@@ -371,10 +423,11 @@ Stop the service:
 docker compose down
 ```
 
-The `insightface-models` volume caches model weights and `face-data` preserves
-registered embeddings. `docker compose down` retains both volumes. Do not use
-`docker compose down -v` unless you intentionally want to delete the registered
-biometric templates and downloaded model files.
+The `insightface-models` volume caches model weights. `face-data` retains the
+legacy SQLite database as a fallback and migration source. With PostgreSQL
+enabled, active biometric templates live in PostgreSQL. `docker compose down`
+retains named volumes; do not use `docker compose down -v` until any required
+SQLite migration is complete.
 
 To use another host port:
 
@@ -395,18 +448,72 @@ docker run --rm \
 ```
 
 The container uses one Uvicorn worker because every worker will load a separate
-copy of the InsightFace model into memory. The named volume preserves downloaded
-models between container runs; `face-data` preserves registered embeddings.
+copy of the InsightFace model into memory. The named model volume preserves
+downloaded models between container runs.
 
 ## Storage design
 
-`SQLiteEmbeddingRepository` implements an `EmbeddingRepository` protocol.
-Embeddings are stored as 512 little-endian float32 values in a BLOB. The
-database stores no source image. This local implementation is intended for
-independent development and single-service deployment.
+Both `PostgreSQLEmbeddingRepository` and `SQLiteEmbeddingRepository` implement
+the same repository protocol. PostgreSQL stores an L2-normalized vector as
+2,048 bytes in a `BYTEA` column: 512 little-endian float32 values. SQLite uses
+the identical binary representation in a BLOB. Neither backend stores the
+source face image.
 
-For multi-instance deployment, implement the same repository protocol with
-PostgreSQL/pgvector or make the Spring Boot service the system of record.
+### Shared PostgreSQL with Spring Boot
+
+The Spring Boot service remains the schema owner through Flyway. Migration
+`V5__create_face_embeddings.sql` lives in the attendance backend's
+`src/main/resources/db/migration/` directory. Start Spring Boot once so Flyway
+records and applies it in each environment.
+
+The existing Spring `face_registrations` table remains application metadata.
+The new `face_embeddings` table stores the biometric vector in the same
+`smart_attendance` database. Both rows use the same Spring student UUID and the
+same `embedding_id`, preserving the current REST integration contract.
+
+Spring Boot uses a JDBC URL:
+
+```text
+jdbc:postgresql://localhost:5432/smart_attendance
+```
+
+The Dockerized Python service uses a Psycopg URL and must address a PostgreSQL
+server running on the host as `host.docker.internal`:
+
+```env
+FACE_DATABASE_URL=postgresql://smart_attendance:change-me@host.docker.internal:5432/smart_attendance
+```
+
+If both services and PostgreSQL share one Compose network, replace
+`host.docker.internal` with the PostgreSQL Compose service name. Use separate,
+least-privilege database credentials outside local development.
+
+To preserve existing SQLite registrations, first copy the legacy database out
+of the running container, then run the one-time migration from the host:
+
+```bash
+mkdir -p data
+docker cp \
+  facerecognizeai-ai-face-service-1:/service/data/faces.db \
+  data/faces-from-docker.db
+
+FACE_DATABASE_URL='postgresql://smart_attendance:smart_attendance@localhost:5432/smart_attendance' \
+python -m scripts.migrate_sqlite_embeddings_to_postgres \
+  --sqlite data/faces-from-docker.db
+```
+
+The migration preserves existing embedding IDs so Spring's current
+`face_registrations.embedding_id` references remain valid. After migration,
+rebuild and recreate the AI service:
+
+```bash
+docker compose up -d --build --force-recreate
+```
+
+`BYTEA` is appropriate for verification by a known student ID because the
+service loads only one vector and computes cosine similarity in Python. Add
+`pgvector` later only if the product needs database-side nearest-neighbor face
+identification across many students.
 
 ## Threshold calibration
 

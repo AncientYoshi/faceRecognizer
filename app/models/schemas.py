@@ -1,8 +1,9 @@
 """Public API response schemas."""
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ApiModel(BaseModel):
@@ -21,6 +22,30 @@ class RegisterFaceResponse(ApiModel):
 class VerifyFaceResponse(ApiModel):
     matched: bool
     similarity: float
+
+
+class IdentifyFaceResponse(ApiModel):
+    matched: bool
+    student_id: UUID | None = Field(alias="studentId")
+    similarity: Annotated[float, Field(ge=0.0, le=1.0)]
+    liveness_passed: bool = Field(alias="livenessPassed")
+    reason: Literal[
+        "MATCHED",
+        "NOT_MATCHED",
+        "NO_FACE_DETECTED",
+        "MULTIPLE_FACES",
+        "LIVENESS_FAILED",
+    ]
+
+    @model_validator(mode="after")
+    def validate_match_identity(self) -> Self:
+        if self.matched and self.student_id is None:
+            raise ValueError("A matched response requires studentId.")
+        if self.matched and self.reason != "MATCHED":
+            raise ValueError("A matched response requires reason MATCHED.")
+        if not self.matched and self.student_id is not None:
+            raise ValueError("An unmatched response must not include studentId.")
+        return self
 
 
 class BoundingBox(ApiModel):
